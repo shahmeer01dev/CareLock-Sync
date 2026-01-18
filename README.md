@@ -1,2 +1,1 @@
-# CareLock-Sync
 FYP
