@@ -1,5 +1,5 @@
-from langchain.vectorstores import Chroma
-from langchain.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from transformers import pipeline
 
 VECTOR_DB_DIR = "../vector_db"
@@ -8,51 +8,41 @@ def load_vector_store():
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
-
-    vectordb = Chroma(
-        persist_directory=VECTOR_DB_DIR,
-        embedding_function=embeddings
-    )
-
-    return vectordb
+    return Chroma(persist_directory=VECTOR_DB_DIR, embedding_function=embeddings)
 
 def load_llm():
-    """
-    Lightweight local text-generation model
-    """
+    # T5 is a text-to-text model, so we use that pipeline type
     return pipeline(
-        "text-generation",
+        "text2text-generation",
         model="google/flan-t5-base",
-        max_length=256
+        max_length=512
     )
 
 def ask_question(vectordb, llm, question):
-    docs = vectordb.similarity_search(question, k=2)
+    # 1. Retrieve relevant data
+    docs = vectordb.similarity_search(question, k=3)
+    context = "\n---\n".join([doc.page_content for doc in docs])
 
-    context = "\n".join([doc.page_content for doc in docs])
-
-    prompt = f"""
-You are a clinical assistant.
-Answer ONLY using the context below.
-If the answer is not in the context, say "Not available in hospital data".
+    # 2. Formulate the prompt
+    prompt = f"""Use the following context to answer the question. 
+If the answer is not in the context, say "Data not available".
 
 Context:
 {context}
 
-Question:
-{question}
+Question: {question}
+Answer:"""
 
-Answer:
-"""
-
-    response = llm(prompt)[0]["generated_text"]
-    return response
+    # 3. Generate Answer
+    # T5 returns a list of dicts: [{'generated_text': 'The Answer'}]
+    result = llm(prompt)
+    return result[0]['generated_text']
 
 if __name__ == "__main__":
     print("🔍 Loading vector store...")
     vectordb = load_vector_store()
 
-    print("🤖 Loading local language model...")
+    print("🤖 Loading AI Model (Flan-T5)...")
     llm = load_llm()
 
     print("\n✅ CareLock RAG Chatbot Ready\n")
@@ -62,6 +52,7 @@ if __name__ == "__main__":
         if question.lower() == "exit":
             break
 
+        print("\n🤔 Thinking...")
         answer = ask_question(vectordb, llm, question)
-        print("\n🧠 Answer:\n", answer)
+        print(f"🧠 Answer: {answer}")
         print("-" * 50)
