@@ -1,4 +1,0 @@
-langchain
-chromadb
-psycopg2-binary
-sentence-transformers

@@ -1,5 +1,0 @@
-langchain
-chromadb
-psycopg2-binary
-openai
-tiktoken
