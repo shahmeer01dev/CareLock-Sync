@@ -3,7 +3,7 @@
 **Hospital Database Synchronization System with Automated FHIR Mapping**
 
 > Final Year Project - BS Computer Science  
-> FAST-NUCES Islamabad  
+> Bahria University Lahore Campus 
 > Team: Waleed Khalid, Muhammad Mohsin, Shahmeer Nadeem  
 > Supervisor: Dr. Muhammad Saqib Sohail
 
@@ -210,10 +210,10 @@ This is a Final Year Project for educational purposes.
 ## 🙏 Acknowledgments
 
 - Dr. Muhammad Saqib Sohail for supervision
-- FAST-NUCES for resources
+- Bahria University Lahore Campus for resources
 - HL7 FHIR community for standards
 
 ---
 
-**Last Updated**: January 31, 2026  
+**Last Updated**: February 1st, 2026  
 **Version**: 0.3.0 (Phase 2 Complete)
