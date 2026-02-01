@@ -1,7 +1,0 @@
-langchain
-chromadb
-sentence-transformers
-transformers
-torch
-fastapi
-uvicorn
