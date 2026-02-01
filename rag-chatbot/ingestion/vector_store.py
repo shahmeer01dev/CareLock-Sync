@@ -1,24 +1,22 @@
-from db_reader import fetch_fhir_patients, fhir_patient_to_text
-from langchain.vectorstores import Chroma
-from langchain.embeddings import HuggingFaceEmbeddings
+from db_reader import fetch_data_for_rag
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
 import os
+import shutil
 
-# Directory where vectors will be stored
 VECTOR_DB_DIR = "../vector_db"
 
 def build_vector_store():
-    print("Loading FHIR patient data from central DB...")
-    rows = fetch_fhir_patients()
+    # Clear old DB to prevent duplicates
+    if os.path.exists(VECTOR_DB_DIR):
+        shutil.rmtree(VECTOR_DB_DIR)
 
-    documents = []
-    for row in rows:
-        patient_resource = row[0]
-        text = fhir_patient_to_text(patient_resource)
-        documents.append(text)
+    print("🔌 Fetching unified clinical data (Patients + Labs)...")
+    documents = fetch_data_for_rag()
 
-    print(f"Total documents prepared: {len(documents)}")
+    print(f"📚 preparing to embed {len(documents)} clinical records...")
 
-    # Local embedding model (safe for FYP, no API key)
+    # Local embedding model
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
@@ -31,7 +29,7 @@ def build_vector_store():
     )
 
     vectordb.persist()
-    print("✅ Vector store created successfully!")
+    print("✅ Vector store created successfully! The brain is updated.")
 
 if __name__ == "__main__":
     build_vector_store()
