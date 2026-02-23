@@ -1,0 +1,25 @@
+====================================================================
+ SPRINT 4 — RAG ACCURACY BENCHMARK
+ Model: llama3.2:3b   KB: 41 mappings   Date: 2026-02-14 20:40
+====================================================================
+
+PART 1 — KNOWN FIELDS (ground-truth accuracy)
+  Field                  Resource             Suggested                                 Conf  Result
+  ----------------------------------------------------------------------------------------------------
+  last_name              ERROR: ('Connection aborted.', ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host', None, 10054, None))
+  first_name             ERROR: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=120)
+  date_of_birth          ERROR: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=120)
+  gender                 ERROR: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=120)
+  phone_number           ERROR: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=120)
+  email                  ERROR: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=120)
+  zip_code               ERROR: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=120)
+  city                   ERROR: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=120)
+  admission_date         ERROR: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=120)
+  discharge_date         ERROR: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=120)
+  chief_complaint        ERROR: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=120)
+  test_name              ERROR: ('Connection aborted.', ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host', None, 10054, None))
+  result_value           ERROR: HTTPConnectionPool(host='localhost', port=8000): Max retries exceeded with url: /api/v1/rag/suggest/field (Caused by NewConnectionError("HTTPConnection(host='localhost', port=8000): Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it"))
+  result_unit            ERROR: HTTPConnectionPool(host='localhost', port=8000): Max retries exceeded with url: /api/v1/rag/suggest/field (Caused by NewConnectionError("HTTPConnection(host='localhost', port=8000): Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it"))
+  medication_name        ERROR: HTTPConnectionPool(host='localhost', port=8000): Max retries exceeded with url: /api/v1/rag/suggest/field (Caused by NewConnectionError("HTTPConnection(host='localhost', port=8000): Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it"))
+  start_date             ERROR: HTTPConnectionPool(host='localhost', port=8000): Max retries exceeded with url: /api/v1/rag/suggest/field (Caused by NewConnectionError("HTTPConnection(host='localhost', port=8000): Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it"))
+

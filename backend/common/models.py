@@ -34,8 +34,6 @@ class Patient(Base):
     
     # Relationships
     encounters = relationship("Encounter", back_populates="patient")
-    lab_results = relationship("LabResult", back_populates="patient")
-    medications = relationship("Medication", back_populates="patient")
     
     def __repr__(self):
         return f"<Patient(id={self.patient_id}, mrn={self.medical_record_number}, name={self.first_name} {self.last_name})>"
@@ -61,62 +59,51 @@ class Encounter(Base):
     
     # Relationships
     patient = relationship("Patient", back_populates="encounters")
-    lab_results = relationship("LabResult", back_populates="encounter")
-    medications = relationship("Medication", back_populates="encounter")
     
     def __repr__(self):
         return f"<Encounter(id={self.encounter_id}, patient_id={self.patient_id}, type={self.encounter_type})>"
 
 
 class LabResult(Base):
-    """LabResult model - represents laboratory test results"""
+    """LabResult model - matches actual hospital DB schema (lab_result_id PK, unit column)"""
     __tablename__ = 'lab_results'
     
-    lab_id = Column(Integer, primary_key=True, index=True)
-    encounter_id = Column(Integer, ForeignKey('encounters.encounter_id'), nullable=False, index=True)
-    patient_id = Column(Integer, ForeignKey('patients.patient_id'), nullable=False, index=True)
-    test_name = Column(String(200), nullable=False)
-    test_code = Column(String(50))
-    result_value = Column(String(200))
-    result_unit = Column(String(50))
+    lab_result_id = Column(Integer, primary_key=True, index=True)
+    encounter_id  = Column(Integer, ForeignKey('encounters.encounter_id'), index=True)
+    patient_id    = Column(Integer, ForeignKey('patients.patient_id'), nullable=False, index=True)
+    test_name     = Column(String(200))
+    result_value  = Column(String(200))
+    unit          = Column(String(50))        # actual column name in DB
     reference_range = Column(String(100))
-    abnormal_flag = Column(String(20))
-    performed_date = Column(DateTime, nullable=False)
-    result_date = Column(DateTime)
-    performing_lab = Column(String(200))
-    technician_name = Column(String(200))
-    created_at = Column(DateTime, default=datetime.utcnow)
+    status        = Column(String(50))
+    performed_date = Column(DateTime)
+    created_at    = Column(DateTime, default=datetime.utcnow)
     
-    # Relationships
-    patient = relationship("Patient", back_populates="lab_results")
-    encounter = relationship("Encounter", back_populates="lab_results")
+    # Relationships removed — parent models no longer declare lab_results/medications
+
     
     def __repr__(self):
         return f"<LabResult(id={self.lab_id}, test={self.test_name}, value={self.result_value})>"
 
 
 class Medication(Base):
-    """Medication model - represents prescribed medications"""
+    """Medication model - matches actual hospital DB schema"""
     __tablename__ = 'medications'
     
     medication_id = Column(Integer, primary_key=True, index=True)
-    encounter_id = Column(Integer, ForeignKey('encounters.encounter_id'), nullable=False, index=True)
-    patient_id = Column(Integer, ForeignKey('patients.patient_id'), nullable=False, index=True)
-    medication_name = Column(String(200), nullable=False)
-    dosage = Column(String(100))
-    frequency = Column(String(100))
-    route = Column(String(50))
-    start_date = Column(Date, nullable=False)
-    end_date = Column(Date)
-    prescribing_physician = Column(String(200))
-    pharmacy_notes = Column(Text)
-    status = Column(String(50))
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    encounter_id  = Column(Integer, ForeignKey('encounters.encounter_id'), index=True)
+    patient_id    = Column(Integer, ForeignKey('patients.patient_id'), nullable=False, index=True)
+    medication_name = Column(String(200))
+    dosage        = Column(String(100))
+    frequency     = Column(String(100))
+    route         = Column(String(50))
+    start_date    = Column(Date)
+    status        = Column(String(50))
+    created_at    = Column(DateTime, default=datetime.utcnow)
+    updated_at    = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
-    # Relationships
-    patient = relationship("Patient", back_populates="medications")
-    encounter = relationship("Encounter", back_populates="medications")
+    # Relationships removed — parent models no longer declare medications
+
     
     def __repr__(self):
         return f"<Medication(id={self.medication_id}, name={self.medication_name}, status={self.status})>"

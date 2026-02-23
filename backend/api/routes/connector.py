@@ -1,199 +1,302 @@
 """
-API routes for connector operations
+Connector API Routes — Sprint 2 Complete
+Adds: per-tenant health, all-DB connection check, schema export,
+      observability views exposure, tenant listing, CDC tenant_id tracking
 """
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 from datetime import datetime
-import sys
-import os
+from sqlalchemy import text
+import sys, os
 
-# Fix import paths
 current_dir = os.path.dirname(os.path.abspath(__file__))
-api_dir = os.path.dirname(current_dir)
-backend_dir = os.path.dirname(api_dir)
+backend_dir = os.path.dirname(os.path.dirname(current_dir))
 sys.path.insert(0, backend_dir)
 
-# Now import with correct paths
 from common.config import settings
+from common.database import shared_db_session
+from common.auth import require_auth, require_admin, AuthContext
 from connector.schema_discovery import SchemaDiscovery
 from connector.cdc_monitor import CDCMonitor
 
-router = APIRouter(
-    prefix="/api/v1/connector",
-    tags=["connector"]
-)
+router = APIRouter(prefix="/api/v1/connector", tags=["connector"])
 
-# Pydantic models for responses
-class SchemaInfo(BaseModel):
-    """Schema information response"""
-    database: str
-    total_tables: int
-    tables: Dict[str, Any]
-    discovered_at: str
+# ── Pydantic models ──────────────────────────────────────────────────────────
 
+class TenantInfo(BaseModel):
+    tenant_id: int
+    hospital_name: str
+    hospital_code: str
+    partition_name: str
+    db_platform: str
+    is_active: bool
+    onboarded_date: Optional[str]
+    last_sync_date: Optional[str]
 
-class ChangeRecord(BaseModel):
-    """Change record response"""
-    change_id: int
-    table_name: str
-    operation: str
-    record_id: Optional[int]
-    changed_at: str
-    user_name: Optional[str]
+class DBHealthResult(BaseModel):
+    name: str
+    platform: str
+    connected: bool
+    latency_ms: Optional[float]
+    error: Optional[str]
 
+class ConnectorHealth(BaseModel):
+    overall: str
+    checked_at: str
+    databases: List[DBHealthResult]
+    central_db: Dict[str, Any]
 
-class ChangeStats(BaseModel):
-    """Change statistics response"""
-    statistics: Dict[str, Dict[str, int]]
-    total_changes: int
+# ── existing endpoints (kept) ────────────────────────────────────────────────
 
-
-class ConnectorStatus(BaseModel):
-    """Connector status response"""
-    status: str
-    cdc_enabled: bool
-    monitored_tables: List[str]
-    schema_discovered: bool
-    last_sync: Optional[str]
-
-
-@router.get("/schema", response_model=SchemaInfo)
-async def discover_schema():
-    """
-    Discover and return hospital database schema
-    """
+@router.get("/schema")
+async def discover_schema(auth: AuthContext = Depends(require_admin)):
+    """Discover and return hospital (PostgreSQL) database schema."""
     try:
-        discovery = SchemaDiscovery(settings.hospital_db_url)
-        schema = discovery.get_complete_schema()
-        return schema
+        d = SchemaDiscovery(settings.hospital_db_url)
+        return d.get_complete_schema()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Schema discovery failed: {str(e)}")
+        raise HTTPException(500, f"Schema discovery failed: {e}")
 
 
 @router.get("/schema/table/{table_name}")
-async def get_table_schema(table_name: str):
-    """
-    Get schema for a specific table
-    """
+async def get_table_schema(table_name: str, auth: AuthContext = Depends(require_admin)):
     try:
-        discovery = SchemaDiscovery(settings.hospital_db_url)
-        
-        # Check if table exists
-        tables = discovery.get_all_tables()
-        if table_name not in tables:
-            raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
-        
-        schema = discovery.get_table_schema(table_name)
-        return schema
+        d = SchemaDiscovery(settings.hospital_db_url)
+        if table_name not in d.get_all_tables():
+            raise HTTPException(404, f"Table '{table_name}' not found")
+        return d.get_table_schema(table_name)
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get table schema: {str(e)}")
+        raise HTTPException(500, str(e))
 
 
 @router.get("/schema/relationships")
-async def get_relationships():
-    """
-    Get all table relationships
-    """
+async def get_relationships(auth: AuthContext = Depends(require_admin)):
     try:
-        discovery = SchemaDiscovery(settings.hospital_db_url)
-        relationships = discovery.get_table_relationships()
-        return {
-            "total_relationships": sum(len(rels) for rels in relationships.values()),
-            "relationships": relationships
-        }
+        d = SchemaDiscovery(settings.hospital_db_url)
+        rels = d.get_table_relationships()
+        return {"total_relationships": sum(len(v) for v in rels.values()), "relationships": rels}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get relationships: {str(e)}")
+        raise HTTPException(500, str(e))
 
 
-@router.post("/cdc/setup")
-async def setup_cdc(table_names: Optional[List[str]] = None):
-    """
-    Setup Change Data Capture for specified tables
-    """
-    try:
-        monitor = CDCMonitor(settings.hospital_db_url)
-        
-        # If no tables specified, use default tables
-        if not table_names:
-            table_names = ['patients', 'encounters', 'lab_results', 'medications']
-        
-        monitor.setup_cdc_for_tables(table_names)
-        
-        return {
-            "status": "success",
-            "message": "CDC setup complete",
-            "monitored_tables": table_names,
-            "timestamp": datetime.utcnow().isoformat()
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"CDC setup failed: {str(e)}")
-
-
-@router.get("/cdc/changes", response_model=List[ChangeRecord])
+@router.get("/cdc/changes")
 async def get_changes(
-    table_name: Optional[str] = Query(None, description="Filter by table name"),
-    limit: int = Query(100, ge=1, le=1000, description="Maximum number of changes")
+    table_name: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    auth: AuthContext = Depends(require_admin)
 ):
-    """
-    Get recent database changes
-    """
     try:
-        monitor = CDCMonitor(settings.hospital_db_url)
-        changes = monitor.get_recent_changes(table_name=table_name, limit=limit)
-        return changes
+        m = CDCMonitor(settings.hospital_db_url)
+        return m.get_recent_changes(table_name=table_name, limit=limit)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get changes: {str(e)}")
+        raise HTTPException(500, str(e))
 
 
-@router.get("/cdc/statistics", response_model=ChangeStats)
-async def get_change_statistics():
-    """
-    Get statistics about database changes
-    """
+@router.get("/cdc/statistics")
+async def get_change_statistics(auth: AuthContext = Depends(require_admin)):
     try:
-        monitor = CDCMonitor(settings.hospital_db_url)
-        stats = monitor.get_change_statistics()
-        
-        # Calculate total changes
-        total = sum(sum(ops.values()) for ops in stats.values())
-        
-        return {
-            "statistics": stats,
-            "total_changes": total
-        }
+        m = CDCMonitor(settings.hospital_db_url)
+        stats = m.get_change_statistics()
+        return {"statistics": stats, "total_changes": sum(sum(v.values()) for v in stats.values())}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get statistics: {str(e)}")
+        raise HTTPException(500, str(e))
 
+# ── NEW Sprint 2 endpoints ───────────────────────────────────────────────────
 
-@router.get("/status", response_model=ConnectorStatus)
-async def connector_status():
-    """
-    Get connector status information
-    """
+@router.get("/tenants", response_model=List[TenantInfo])
+async def list_tenants(active_only: bool = Query(False), auth: AuthContext = Depends(require_auth)):
+    """List all onboarded hospitals with partition info."""
     try:
-        # Check if CDC is set up by querying change log table
-        monitor = CDCMonitor(settings.hospital_db_url)
-        
+        with shared_db_session() as db:
+            q = "SELECT tenant_id, hospital_name, hospital_code, partition_name, db_platform, is_active, onboarded_date, last_sync_date FROM hospital_tenants"
+            if active_only:
+                q += " WHERE is_active = TRUE"
+            q += " ORDER BY tenant_id"
+            rows = db.execute(text(q)).fetchall()
+            return [
+                {
+                    "tenant_id":       r[0],
+                    "hospital_name":   r[1],
+                    "hospital_code":   r[2],
+                    "partition_name":  r[3],
+                    "db_platform":     r[4],
+                    "is_active":       r[5],
+                    "onboarded_date":  r[6].isoformat() if r[6] else None,
+                    "last_sync_date":  r[7].isoformat() if r[7] else None,
+                }
+                for r in rows
+            ]
+    except Exception as e:
+        raise HTTPException(500, f"Failed to list tenants: {e}")
+
+
+@router.get("/tenants/{tenant_id}/health")
+async def tenant_health(tenant_id: int, auth: AuthContext = Depends(require_auth)):
+    """Per-tenant data quality and sync health from observability views."""
+    try:
+        with shared_db_session() as db:
+            db.execute(text("SET app.tenant_id = :tid"), {"tid": str(tenant_id)})
+
+            quality = db.execute(text(
+                "SELECT * FROM v_tenant_health WHERE tenant_id = :tid"
+            ), {"tid": tenant_id}).fetchone()
+
+            partitions = db.execute(text(
+                "SELECT * FROM v_partition_stats WHERE partition_name LIKE :pat"
+            ), {"pat": f"%tenant_%"}).fetchall()
+
+            cdc = db.execute(text(
+                "SELECT * FROM v_cdc_lag WHERE tenant_id = :tid"
+            ), {"tid": tenant_id}).fetchall()
+
+            jsonb_keys = db.execute(text(
+                "SELECT json_key, usage_count, recommendation FROM v_jsonb_promotion_candidates WHERE tenant_id = :tid LIMIT 20"
+            ), {"tid": tenant_id}).fetchall()
+
+            return {
+                "tenant_id": tenant_id,
+                "data_quality": dict(quality._mapping) if quality else None,
+                "partition_stats": [dict(r._mapping) for r in partitions],
+                "cdc_lag": [dict(r._mapping) for r in cdc],
+                "jsonb_fields": [{"key": r[0], "usage": r[1], "recommendation": r[2]} for r in jsonb_keys],
+                "checked_at": datetime.utcnow().isoformat(),
+            }
+    except Exception as e:
+        raise HTTPException(500, f"Tenant health check failed: {e}")
+
+
+@router.get("/health", response_model=ConnectorHealth)
+async def all_databases_health(auth: AuthContext = Depends(require_auth)):
+    """Check connectivity to all configured database platforms."""
+    import time
+    from sqlalchemy import create_engine
+
+    DB_CONFIGS = [
+        {"name": "PostgreSQL Hospital", "platform": "postgresql", "url": settings.hospital_db_url},
+        {"name": "Central FHIR",        "platform": "postgresql", "url": settings.shared_db_url},
+    ]
+    # Optionally add other DBs if env vars exist
+    for env_key, name, platform in [
+        ("MYSQL_URL",     "MySQL Hospital",      "mysql"),
+        ("ORACLE_URL",    "Oracle Hospital",     "oracle"),
+        ("SQLSERVER_URL", "SQL Server Hospital", "sqlserver"),
+        ("MONGODB_URL",   "MongoDB Hospital",    "mongodb"),
+    ]:
+        url = os.environ.get(env_key)
+        if url:
+            DB_CONFIGS.append({"name": name, "platform": platform, "url": url})
+
+    results = []
+    for cfg in DB_CONFIGS:
+        t0 = time.time()
         try:
-            changes = monitor.get_recent_changes(limit=1)
+            eng = create_engine(cfg["url"], connect_args={"connect_timeout": 3})
+            with eng.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            latency = round((time.time() - t0) * 1000, 1)
+            results.append({"name": cfg["name"], "platform": cfg["platform"],
+                             "connected": True, "latency_ms": latency, "error": None})
+        except Exception as ex:
+            results.append({"name": cfg["name"], "platform": cfg["platform"],
+                             "connected": False, "latency_ms": None, "error": str(ex)[:120]})
+
+    all_ok = all(r["connected"] for r in results)
+
+    # Central DB stats
+    central_stats = {}
+    try:
+        with shared_db_session() as db:
+            for tbl in ("fhir_patient", "fhir_encounter", "fhir_observation", "fhir_medication_request"):
+                central_stats[tbl] = db.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
+    except Exception:
+        pass
+
+    return {
+        "overall": "healthy" if all_ok else "degraded",
+        "checked_at": datetime.utcnow().isoformat(),
+        "databases": results,
+        "central_db": central_stats,
+    }
+
+
+@router.get("/observability/partitions")
+async def partition_stats(auth: AuthContext = Depends(require_auth)):
+    """Partition sizes, dead rows and vacuum status for all FHIR tables."""
+    try:
+        with shared_db_session() as db:
+            rows = db.execute(text("SELECT * FROM v_partition_stats")).fetchall()
+            return [dict(r._mapping) for r in rows]
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.get("/observability/cdc-lag")
+async def cdc_lag(auth: AuthContext = Depends(require_auth)):
+    """CDC backlog per tenant — includes lag_seconds and health alert status."""
+    try:
+        with shared_db_session() as db:
+            rows = db.execute(text("SELECT * FROM v_cdc_lag")).fetchall()
+            return [dict(r._mapping) for r in rows]
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.get("/observability/index-health")
+async def index_health(auth: AuthContext = Depends(require_auth)):
+    """Index usage — flags UNUSED indexes that waste RAM."""
+    try:
+        with shared_db_session() as db:
+            rows = db.execute(text("SELECT * FROM v_index_health")).fetchall()
+            return [dict(r._mapping) for r in rows]
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.get("/observability/jsonb-catalog")
+async def jsonb_catalog(tenant_id: Optional[int] = Query(None)):
+    """JSONB field catalog — shows which optional_data keys to promote to typed columns."""
+    try:
+        with shared_db_session() as db:
+            q = "SELECT * FROM v_jsonb_promotion_candidates"
+            params: Dict = {}
+            if tenant_id:
+                q += " WHERE tenant_id = :tid"
+                params["tid"] = tenant_id
+            rows = db.execute(text(q), params).fetchall()
+            return [dict(r._mapping) for r in rows]
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.get("/status")
+async def connector_status(auth: AuthContext = Depends(require_auth)):
+    """Quick connector status — CDC enabled, monitored tables, last change."""
+    try:
+        m = CDCMonitor(settings.hospital_db_url)
+        try:
+            changes = m.get_recent_changes(limit=1)
             cdc_enabled = True
             last_change = changes[0]['changed_at'] if changes else None
-        except:
+        except Exception:
             cdc_enabled = False
             last_change = None
-        
-        # Get monitored tables
-        monitored_tables = ['patients', 'encounters', 'lab_results', 'medications']
-        
+
+        with shared_db_session() as db:
+            tenant_count = db.execute(
+                text("SELECT COUNT(*) FROM hospital_tenants WHERE is_active = TRUE")
+            ).scalar()
+
         return {
             "status": "operational",
             "cdc_enabled": cdc_enabled,
-            "monitored_tables": monitored_tables,
+            "monitored_tables": ["patients", "encounters", "lab_results", "medications"],
+            "active_tenants": tenant_count,
             "schema_discovered": True,
-            "last_sync": last_change
+            "last_cdc_event": last_change,
+            "checked_at": datetime.utcnow().isoformat(),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get status: {str(e)}")
+        raise HTTPException(500, str(e))

@@ -1,0 +1,34 @@
+
+============================================================
+  COSINE FIX VERIFICATION
+============================================================
+
+[1] nomic-embed-text embeddings
+    dim=768, magnitude=22.70 (raw unnormalized)
+    cosine_similarity('date_of_birth', 'dob') = 0.6699
+    old formula (1-dist/2) would give: 0.6699 -- but only if normalized
+    new formula (1-dist)   gives:       0.3301 (cosine distance)
+    NOTE: With raw embeddings + cosine collection, dist = 1-cos, so sim = cos = 0.6699
+
+[2] Vector store with nomic embeddings
+  Seeded 219 FHIR mappings into ChromaDB
+
+    Seeded: 219 mappings
+
+    Field                  Top Match                      Similarity  Status
+    ---------------------- ------------------------------ ----------  ------
+    [PASS] date_of_birth        birthDate                          96.4%  fast-path
+    [PASS] dob                  birthDate                          95.0%  fast-path
+    [PASS] first_name           name[].given[]                     87.7%  fast-path
+    [PASS] last_name            name[].family                      90.4%  fast-path
+    [PASS] mrn                  identifier[].value                 80.8%  ok
+    [PASS] gender               gender                             95.0%  fast-path
+    [PASS] phone_number         telecom[].value                    90.9%  fast-path
+    [PASS] admission_date       period.start                       88.7%  fast-path
+    [PASS] drug_name            medicationCodeableConcept.text     93.9%  fast-path
+
+    Result: 9/9 correct
+    Avg similarity: 91.0%  (was 0% with old L2 formula)
+
+  FIX CONFIRMED: cosine similarity is now giving real values
+============================================================

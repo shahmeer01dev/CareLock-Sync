@@ -5,15 +5,14 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from datetime import datetime
-import sys
-import os
+import sys, os
 
-# Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.database import get_hospital_db, get_shared_db
-from common.schemas import DatabaseStatus, SystemStatus
-from common.models import Patient, Encounter, LabResult, Medication
+from common.schemas  import DatabaseStatus, SystemStatus
+from common.models   import Patient, Encounter, LabResult, Medication
+from common.auth     import require_auth, AuthContext
 
 router = APIRouter(
     prefix="/api/v1/status",
@@ -22,7 +21,10 @@ router = APIRouter(
 
 
 @router.get("/database/hospital", response_model=DatabaseStatus)
-async def hospital_database_status(db: Session = Depends(get_hospital_db)):
+async def hospital_database_status(
+    db:   Session      = Depends(get_hospital_db),
+    auth: AuthContext  = Depends(require_auth)
+):
     """
     Get hospital database status and statistics
     """
@@ -54,7 +56,10 @@ async def hospital_database_status(db: Session = Depends(get_hospital_db)):
 
 
 @router.get("/database/shared", response_model=DatabaseStatus)
-async def shared_database_status(db: Session = Depends(get_shared_db)):
+async def shared_database_status(
+    db:   Session      = Depends(get_shared_db),
+    auth: AuthContext  = Depends(require_auth)
+):
     """
     Get shared database status and statistics
     """
@@ -94,8 +99,9 @@ async def shared_database_status(db: Session = Depends(get_shared_db)):
 
 @router.get("/system", response_model=SystemStatus)
 async def system_status(
-    hospital_db: Session = Depends(get_hospital_db),
-    shared_db: Session = Depends(get_shared_db)
+    hospital_db: Session      = Depends(get_hospital_db),
+    shared_db:   Session      = Depends(get_shared_db),
+    auth:        AuthContext   = Depends(require_auth)
 ):
     """
     Get overall system status including all databases

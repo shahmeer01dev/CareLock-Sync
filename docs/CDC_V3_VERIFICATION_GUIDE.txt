@@ -1,0 +1,539 @@
+═══════════════════════════════════════════════════════════════════
+  CDC MONITOR v3 — COMPREHENSIVE VERIFICATION GUIDE
+═══════════════════════════════════════════════════════════════════
+
+This guide verifies that all 9 risks from the CDC v2 audit have been
+properly addressed in v3. Each risk is mapped to:
+  • Code changes in cdc_monitor.py
+  • Test coverage in test_cdc_monitor.py, test_cdc_performance.py, test_cdc_v3_specific.py
+
+═══════════════════════════════════════════════════════════════════
+  RISK 1 — Trigger Per-Row SELECT Cost
+═══════════════════════════════════════════════════════════════════
+
+PROBLEM (v2):
+  SELECT value FROM _cdc_config WHERE key = 'tenant_id'
+  executed on EVERY row insert/update/delete.
+  → 10,000 row batch = 10,000 index lookups
+
+FIX (v3):
+  ✓ current_setting('app.tenant_id', true) — GUC cache (nanosecond)
+  ✓ _cdc_config only as fallback when GUC absent
+  ✓ CDCMonitor.set_session_tenant(conn, tid) for app setup
+
+CODE MARKERS:
+  backend/connector/cdc_monitor.py:
+    Line ~80:  @staticmethod def set_session_tenant(conn, tenant_id)
+    Line ~280: guc_val := current_setting('app.tenant_id', true)
+    Line ~283: IF guc_val IS NOT NULL AND guc_val <> '' THEN
+    Line ~286: ELSE ... SELECT value FROM _cdc_config (fallback)
+
+TEST COVERAGE:
+  tests/unit/test_cdc_v3_specific.py:
+    ✓ TestGUCFastPath::test_set_session_tenant_method_exists
+    ✓ TestGUCFastPath::test_session_tenant_flows_to_change_log
+  
+  tests/unit/test_cdc_performance.py:
+    ✓ TestHighVolumeBurst::test_burst_tenant_id_consistent (1000 rows)
+
+VERIFICATION COMMANDS:
+  pytest tests/unit/test_cdc_v3_specific.py::TestGUCFastPath -v
+  pytest tests/unit/test_cdc_performance.py::TestHighVolumeBurst -v -s
+
+EXPECTED RESULT:
+  • set_session_tenant() exists and is callable
+  • Rows inserted with GUC set show correct tenant_id
+  • 1000-row burst maintains consistent tenant_id
+  • Per-row overhead < 5ms (includes GUC lookup + trigger)
+
+═══════════════════════════════════════════════════════════════════
+  RISK 2 — DROP … CASCADE in Setup
+═══════════════════════════════════════════════════════════════════
+
+PROBLEM (v2):
+  DROP FUNCTION IF EXISTS log_data_change() CASCADE
+  → Silently destroys dependent triggers without warning
+
+FIX (v3):
+  ✓ Query pg_trigger to find all dependent triggers first
+  ✓ Drop each trigger explicitly: DROP TRIGGER <name> ON <table>
+  ✓ Then DROP FUNCTION without CASCADE
+  ✓ Canonical log_table_changes uses CREATE OR REPLACE (never drops deps)
+
+CODE MARKERS:
+  backend/connector/cdc_monitor.py:
+    Line ~230: SELECT t.tgname, c.relname FROM pg_trigger t
+    Line ~240: DROP TRIGGER IF EXISTS {trig_name} ON {tbl_name}
+    Line ~245: DROP FUNCTION IF EXISTS log_data_change(); -- no CASCADE
+    Line ~250: CREATE OR REPLACE FUNCTION log_table_changes()
+
+TEST COVERAGE:
+  tests/unit/test_cdc_monitor.py:
+    ✓ TestSchema::test_no_legacy_log_data_change_function
+    ✓ TestSchema::test_canonical_trigger_function_exists
+
+VERIFICATION COMMANDS:
+  pytest tests/unit/test_cdc_monitor.py::TestSchema -v
+
+EXPECTED RESULT:
+  • log_data_change does NOT exist in pg_proc
+  • log_table_changes DOES exist in pg_proc
+  • No orphaned triggers referencing deleted functions
+
+═══════════════════════════════════════════════════════════════════
+  RISK 3 — Large Batches & Memory
+═══════════════════════════════════════════════════════════════════
+
+PROBLEM (v2):
+  get_changes_since() loads entire result set into Python list
+  → Millions of rows = out-of-memory crash
+
+FIX (v3):
+  ✓ get_changes_since(batch_size=N) — eager bounded load
+  ✓ iter_changes_since(batch_size=N) — generator with server-side cursor
+  ✓ psycopg2 named cursor: only current batch in memory
+  ✓ incremental_sync.py uses generator
+
+CODE MARKERS:
+  backend/connector/cdc_monitor.py:
+    Line ~465: def iter_changes_since(..., batch_size=500)
+    Line ~490: raw_conn = self.engine.raw_connection()
+    Line ~492: cur = raw_conn.cursor(cursor_name)  # server-side
+    Line ~495: rows = cur.fetchmany(batch_size)
+
+TEST COVERAGE:
+  tests/unit/test_cdc_performance.py:
+    ✓ TestStreamingGenerator::test_streaming_yields_correct_total (600 rows)
+    ✓ TestStreamingGenerator::test_streaming_ordered_asc
+    ✓ TestStreamingGenerator::test_eager_batch_size_respected
+
+VERIFICATION COMMANDS:
+  pytest tests/unit/test_cdc_performance.py::TestStreamingGenerator -v -s
+
+EXPECTED RESULT:
+  • 600 rows streamed in 3+ batches (batch_size=200)
+  • change_id ordered ASC across batches
+  • Eager mode respects batch_size limit
+  • Memory stays constant regardless of total rows
+
+═══════════════════════════════════════════════════════════════════
+  RISK 4 — Watermark Advancement on Partial Failures
+═══════════════════════════════════════════════════════════════════
+
+PROBLEM (v2):
+  Watermark in autosync_state.json updated even if batch fails
+  → Lost records, no retry
+
+FIX (v3):
+  ✓ cdc_watermarks table with atomic ON CONFLICT DO UPDATE
+  ✓ advance_watermark() uses GREATEST(stored, new) — never moves backwards
+  ✓ Watermark only advanced AFTER successful batch processing
+  ✓ If batch fails, watermark unchanged → full retry next cycle
+
+CODE MARKERS:
+  backend/connector/cdc_monitor.py:
+    Line ~120: CREATE TABLE IF NOT EXISTS cdc_watermarks
+    Line ~155: GREATEST(cdc_watermarks.last_change_id, EXCLUDED.last_change_id)
+    Line ~145: def advance_watermark(tenant_id, new_id)
+
+TEST COVERAGE:
+  tests/unit/test_cdc_performance.py:
+    ✓ TestWatermarkPersistence::test_advance_never_goes_backwards
+    ✓ TestWatermarkPersistence::test_advance_persists
+    ✓ TestConcurrentWriters::test_concurrent_watermark_advance_is_safe
+
+VERIFICATION COMMANDS:
+  pytest tests/unit/test_cdc_performance.py::TestWatermarkPersistence -v
+  pytest tests/unit/test_cdc_performance.py::TestConcurrentWriters::test_concurrent_watermark_advance_is_safe -v
+
+EXPECTED RESULT:
+  • advance_watermark(t, 1000) then advance_watermark(t, 200) → stays at 1000
+  • 100 concurrent advance calls → watermark = max(all values)
+  • No race conditions, no backwards movement
+
+═══════════════════════════════════════════════════════════════════
+  RISK 5 — Migration Locking & Downtime
+═══════════════════════════════════════════════════════════════════
+
+PROBLEM (v2):
+  ALTER COLUMN TYPE blocks indefinitely on busy tables
+  → Cascading lock queue, production outage
+
+FIX (v3):
+  ✓ migrate_schema() sets lock_timeout = '5s'
+  ✓ Raises LockNotAvailable immediately instead of hanging
+  ✓ Checks if record_id already TEXT → skips ALTER if unnecessary
+  ✓ Docstring includes pg_repack guidance for zero-downtime
+
+CODE MARKERS:
+  backend/connector/cdc_monitor.py:
+    Line ~550: def migrate_schema()
+    Line ~565: conn.execute(text("SET lock_timeout = '5s'"))
+    Line ~575: if col_type.lower() in ("integer", "bigint", "smallint"):
+    Line ~580: ALTER COLUMN record_id TYPE TEXT USING record_id::TEXT
+    Line ~585: print("consider pg_repack for zero-downtime")
+
+TEST COVERAGE:
+  tests/unit/test_cdc_v3_specific.py:
+    ✓ TestMigration::test_migrate_schema_method_exists
+    ✓ TestMigration::test_migrate_schema_is_idempotent
+    ✓ TestMigration::test_record_id_stays_text_after_migration
+  
+  tests/unit/test_cdc_monitor.py:
+    ✓ TestSchema::test_record_id_is_text
+
+VERIFICATION COMMANDS:
+  pytest tests/unit/test_cdc_v3_specific.py::TestMigration -v
+  pytest tests/unit/test_cdc_monitor.py::TestSchema::test_record_id_is_text -v
+
+EXPECTED RESULT:
+  • migrate_schema() completes without error
+  • Can be called multiple times (idempotent)
+  • record_id is TEXT after migration
+  • Lock timeout set, migration fails fast if blocked
+
+═══════════════════════════════════════════════════════════════════
+  RISK 6 — Per-Tenant Scheduler State
+═══════════════════════════════════════════════════════════════════
+
+PROBLEM (v2):
+  Single autosync_state.json file
+  → No multi-tenant support, no HA, single point of failure
+
+FIX (v3):
+  ✓ cdc_watermarks table with tenant_id PRIMARY KEY
+  ✓ load_watermark(tenant_id) / advance_watermark(tenant_id, id)
+  ✓ Atomic ON CONFLICT DO UPDATE — safe for concurrent workers
+  ✓ Multiple tenants, multiple workers, no file locking
+
+CODE MARKERS:
+  backend/connector/cdc_monitor.py:
+    Line ~120: tenant_id INTEGER PRIMARY KEY
+    Line ~135: def load_watermark(tenant_id)
+    Line ~145: def advance_watermark(tenant_id, new_id)
+    Line ~155: ON CONFLICT (tenant_id) DO UPDATE
+
+TEST COVERAGE:
+  tests/unit/test_cdc_performance.py:
+    ✓ TestWatermarkPersistence::test_watermark_isolated_per_tenant
+    ✓ TestWatermarkPersistence::test_load_returns_zero_for_new_tenant
+    ✓ TestConcurrentWriters::test_concurrent_watermark_advance_is_safe
+
+VERIFICATION COMMANDS:
+  pytest tests/unit/test_cdc_performance.py::TestWatermarkPersistence -v
+
+EXPECTED RESULT:
+  • tenant_id=1 watermark independent from tenant_id=2
+  • New tenant returns 0 (no watermark yet)
+  • Concurrent workers don't corrupt each other's watermarks
+
+═══════════════════════════════════════════════════════════════════
+  RISK 7 — Trigger Permissions & RLS
+═══════════════════════════════════════════════════════════════════
+
+PROBLEM (v2):
+  Trigger runs as calling role → might lack INSERT on data_change_log
+  → RLS policies could block trigger writes
+
+FIX (v3):
+  ✓ SECURITY DEFINER on log_table_changes
+  ✓ Function runs as owner (superuser/DBA), not caller
+  ✓ GRANT EXECUTE TO PUBLIC so all roles can fire trigger
+  ✓ Docstring includes ALTER FUNCTION ... OWNER TO guidance
+
+CODE MARKERS:
+  backend/connector/cdc_monitor.py:
+    Line ~255: SECURITY DEFINER
+    Line ~256: -- Risk 7: run as function owner, not caller role
+    Line ~370: GRANT EXECUTE ON FUNCTION log_table_changes() TO PUBLIC
+
+TEST COVERAGE:
+  tests/unit/test_cdc_v3_specific.py:
+    ✓ TestSecurityDefiner::test_log_table_changes_is_security_definer
+    ✓ TestSecurityDefiner::test_function_has_execute_grant
+  
+  tests/unit/test_cdc_monitor.py:
+    ✓ TestSchema::test_canonical_trigger_function_exists
+
+VERIFICATION COMMANDS:
+  pytest tests/unit/test_cdc_v3_specific.py::TestSecurityDefiner -v
+
+EXPECTED RESULT:
+  • pg_proc.prosecdef = true for log_table_changes
+  • has_function_privilege('public', ..., 'EXECUTE') = true
+  • Trigger works regardless of calling role's permissions
+
+═══════════════════════════════════════════════════════════════════
+  RISK 8 — pg_notify Payload Completeness
+═══════════════════════════════════════════════════════════════════
+
+PROBLEM (v2):
+  Notification payload might be stale or missing tenant_id
+
+FIX (v3):
+  ✓ pg_notify uses tenant_id_value from GUC fast-path
+  ✓ Payload includes: table, operation, record_id, tenant_id, timestamp
+  ✓ ISO 8601 timestamp for unambiguous parsing
+  ✓ Consistent with log row just written
+
+CODE MARKERS:
+  backend/connector/cdc_monitor.py:
+    Line ~340: PERFORM pg_notify('data_changes', json_build_object(
+    Line ~342: 'tenant_id', tenant_id_value,  -- from GUC fast-path
+    Line ~344: 'timestamp', to_char(NOW(), 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+
+TEST COVERAGE:
+  tests/unit/test_cdc_v3_specific.py:
+    ✓ TestNotifyPayload::test_trigger_contains_pg_notify_call
+
+VERIFICATION COMMANDS:
+  pytest tests/unit/test_cdc_v3_specific.py::TestNotifyPayload -v
+
+EXPECTED RESULT:
+  • Trigger function source contains pg_notify
+  • Payload includes 'tenant_id' key
+  • Payload includes ISO timestamp
+  • Manual LISTEN test shows payload arrives correctly
+
+═══════════════════════════════════════════════════════════════════
+  RISK 9 — Concurrency & Performance Tests
+═══════════════════════════════════════════════════════════════════
+
+PROBLEM (v2):
+  No stress tests, no concurrency tests
+  → Unknown performance characteristics, potential race conditions
+
+FIX (v3):
+  ✓ test_cdc_performance.py with 5 test groups
+  ✓ High-volume burst: 1000 rows, <5ms/row overhead
+  ✓ Concurrent writers: 5 threads × 100 rows, no lost data
+  ✓ Streaming generator: 600 rows in batches, memory-safe
+  ✓ Index utilization: EXPLAIN ANALYZE, no seq-scans
+  ✓ Watermark concurrency: 100 threads, GREATEST holds
+
+CODE MARKERS:
+  tests/unit/test_cdc_performance.py:
+    Line ~70:  class TestHighVolumeBurst (N=1000)
+    Line ~110: class TestConcurrentWriters (5 threads × 100 rows)
+    Line ~170: class TestStreamingGenerator (600 rows)
+    Line ~240: class TestIndexUtilization (EXPLAIN plans)
+    Line ~280: class TestWatermarkPersistence (concurrency)
+
+TEST COVERAGE:
+  tests/unit/test_cdc_performance.py:
+    ✓ TestHighVolumeBurst (2 tests)
+    ✓ TestConcurrentWriters (2 tests)
+    ✓ TestStreamingGenerator (3 tests)
+    ✓ TestIndexUtilization (2 tests)
+    ✓ TestWatermarkPersistence (5 tests)
+
+VERIFICATION COMMANDS:
+  pytest tests/unit/test_cdc_performance.py -v -s
+
+EXPECTED RESULT:
+  • 1000 rows: all captured, <5ms/row overhead
+  • 500 concurrent inserts: all captured, no errors
+  • Streaming: 3+ batches, ASC order maintained
+  • Index scans used (no Seq Scan in plans)
+  • 100 concurrent watermark advances: max value wins
+
+═══════════════════════════════════════════════════════════════════
+  COMPLETE TEST SUITE SUMMARY
+═══════════════════════════════════════════════════════════════════
+
+TEST FILES:
+  tests/unit/test_cdc_monitor.py         — 40 tests (8 groups)
+  tests/unit/test_cdc_performance.py     — 14 tests (5 groups)
+  tests/unit/test_cdc_v3_specific.py     — 11 tests (4 groups)
+  ────────────────────────────────────────────────────────
+  TOTAL:                                   65 tests
+
+RISK COVERAGE MATRIX:
+
+  Risk | Code ✓ | Tests | Files
+  ─────┼────────┼───────┼──────────────────────────────────────
+   1   |   ✓    |   3   | v3_specific, performance
+   2   |   ✓    |   2   | monitor
+   3   |   ✓    |   3   | performance
+   4   |   ✓    |   3   | performance
+   5   |   ✓    |   4   | v3_specific, monitor
+   6   |   ✓    |   3   | performance
+   7   |   ✓    |   3   | v3_specific, monitor
+   8   |   ✓    |   1   | v3_specific
+   9   |   ✓    |  14   | performance (entire file)
+
+═══════════════════════════════════════════════════════════════════
+  HOW TO RUN COMPLETE VERIFICATION
+═══════════════════════════════════════════════════════════════════
+
+PREREQUISITES:
+  1. PostgreSQL running (local or Docker)
+  2. Set environment variable:
+     
+     set TEST_DB_URL=postgresql://user:pass@localhost:5432/hospital_db
+     
+     Or it will use HOSPITAL_DB_URL from project .env
+
+  3. Install test dependencies:
+     
+     pip install pytest python-dotenv colorama
+
+OPTION 1 — Run verification script (recommended):
+  
+  python tests\verify_cdc_v3.py
+
+  This will:
+    • Check all code markers for each risk
+    • Run all 65 tests
+    • Produce risk-by-risk coverage report
+    • Exit 0 if all pass, exit 1 if any fail
+
+OPTION 2 — Run test files individually:
+  
+  pytest tests\unit\test_cdc_monitor.py -v
+  pytest tests\unit\test_cdc_performance.py -v -s
+  pytest tests\unit\test_cdc_v3_specific.py -v
+
+OPTION 3 — Run specific risk tests:
+  
+  # Risk 1 — GUC fast-path
+  pytest tests\unit\test_cdc_v3_specific.py::TestGUCFastPath -v
+  
+  # Risk 3 — Streaming generator
+  pytest tests\unit\test_cdc_performance.py::TestStreamingGenerator -v -s
+  
+  # Risk 4 — Watermark safety
+  pytest tests\unit\test_cdc_performance.py::TestWatermarkPersistence -v
+
+OPTION 4 — Run all CDC tests:
+  
+  pytest tests\unit\test_cdc*.py -v -s
+
+═══════════════════════════════════════════════════════════════════
+  EXPECTED OUTPUT (All Tests Pass)
+═══════════════════════════════════════════════════════════════════
+
+RISK VERIFICATION — Code Markers
+Risk 1: Per-row SELECT cost
+  ✓ Found: current_setting('app.tenant_id', true)
+  ✓ Found: def set_session_tenant
+Risk 2: DROP … CASCADE in setup
+  ✓ Found: SELECT t.tgname, c.relname
+  ✓ Found: DROP TRIGGER IF EXISTS
+  ✓ Found: DROP FUNCTION IF EXISTS log_data_change();
+Risk 3: Large batches & memory
+  ✓ Found: def iter_changes_since
+  ✓ Found: raw_conn.cursor(cursor_name)
+  ✓ Found: cur.fetchmany(batch_size)
+... (all 9 risks verified)
+
+RUNNING TESTS
+Running: tests/unit/test_cdc_monitor.py
+✓ PASS (40/40 tests)
+
+Running: tests/unit/test_cdc_performance.py
+✓ PASS (14/14 tests)
+[PERF] 1000 inserts in 3.45s (3.45 ms/row incl. trigger)
+[PERF] 500 concurrent inserts in 2.10s (5 threads)
+[PERF] Streamed 600 rows in 3 batches
+
+Running: tests/unit/test_cdc_v3_specific.py
+✓ PASS (11/11 tests)
+
+SUMMARY
+Code Verification:
+  ✓ All 9 risks addressed in code
+
+Test Execution:
+  ✓ test_cdc_monitor.py
+  ✓ test_cdc_performance.py
+  ✓ test_cdc_v3_specific.py
+
+════════════════════════════════════════════════════════════════
+  ✓✓✓ ALL VERIFICATIONS PASSED ✓✓✓
+════════════════════════════════════════════════════════════════
+
+Test Coverage by Risk:
+  Risk 1: Per-row SELECT cost
+    ✓ TestGUCFastPath::test_set_session_tenant_method_exists
+    ✓ TestGUCFastPath::test_session_tenant_flows_to_change_log
+    ✓ TestHighVolumeBurst::test_burst_tenant_id_consistent
+
+  Risk 2: DROP … CASCADE in setup
+    ✓ TestSchema::test_no_legacy_log_data_change_function
+    ✓ TestSchema::test_canonical_trigger_function_exists
+
+... (coverage for all 9 risks shown)
+
+═══════════════════════════════════════════════════════════════════
+  TROUBLESHOOTING
+═══════════════════════════════════════════════════════════════════
+
+IF TESTS FAIL:
+
+1. "Cannot connect to PostgreSQL":
+   → Check TEST_DB_URL or HOSPITAL_DB_URL
+   → Verify PostgreSQL is running: psql -U <user> -d <db>
+
+2. "Table already exists":
+   → Tests clean up after themselves
+   → If interrupted, run: DROP TABLE cdc_test_* CASCADE;
+
+3. "Permission denied on data_change_log":
+   → Grant INSERT to test user
+   → Or run tests as database owner
+
+4. Performance tests fail (<5ms threshold):
+   → Expected on slow machines / Docker
+   → Adjust threshold in test_cdc_performance.py line 95
+
+5. "lock_timeout" test fails:
+   → PostgreSQL < 9.3 doesn't support lock_timeout
+   → Upgrade or skip migration test
+
+═══════════════════════════════════════════════════════════════════
+  PRODUCTION DEPLOYMENT CHECKLIST
+═══════════════════════════════════════════════════════════════════
+
+After all tests pass:
+
+□ 1. Run migrate_schema() on production:
+     
+     from connector.cdc_monitor import CDCMonitor
+     m = CDCMonitor(prod_db_url)
+     m.migrate_schema()
+
+□ 2. Configure tenant_id:
+     
+     m.configure_tenant(tenant_id=<your_tenant_id>)
+
+□ 3. Set up GUC in connection pool:
+     
+     # In your connection setup code:
+     @event.listens_for(Engine, "connect")
+     def set_tenant_on_connect(dbapi_conn, connection_record):
+         cursor = dbapi_conn.cursor()
+         cursor.execute(f"SET app.tenant_id = {tenant_id}")
+         cursor.close()
+
+□ 4. Verify watermark table exists:
+     
+     SELECT * FROM cdc_watermarks;
+
+□ 5. Update sync code to use generator:
+     
+     for batch in cdc.iter_changes_since(last_id, tenant_id, batch_size=500):
+         process(batch)
+         cdc.advance_watermark(tenant_id, batch[-1]["change_id"])
+
+□ 6. Monitor performance:
+     - Trigger overhead should be <5ms/row
+     - Index scans (not seq scans) on cursor queries
+     - No lock contention on data_change_log
+
+□ 7. Set up monitoring alerts:
+     - Watermark lag (current time vs last_change_id timestamp)
+     - Change log size (schedule periodic VACUUM)
+     - Sync errors (failed batches)
+
+═══════════════════════════════════════════════════════════════════

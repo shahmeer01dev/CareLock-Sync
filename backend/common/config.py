@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     SHARED_DB_NAME: str
     SHARED_DB_USER: str
     SHARED_DB_PASSWORD: str
+    SHARED_DB_SSLMODE: str = "prefer"
     
     # Security
     SECRET_KEY: str
@@ -38,6 +39,13 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     LLM_MODEL: str = "gpt-4"
     
+    # Ollama (Sprint 4 RAG — local LLM, no API key required)
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = "phi3"
+    MAPPING_MODEL: str = "llama3.2:3b"
+    CHAT_MODEL: str = "phi3"
+    CHROMA_PATH: str = "./databases/chroma"
+
     # Vector Database
     CHROMA_DB_PATH: str = "./databases/chroma"
     
@@ -51,8 +59,10 @@ class Settings(BaseSettings):
     
     @property
     def shared_db_url(self) -> str:
-        """Generate PostgreSQL connection URL for shared database"""
-        return f"postgresql://{self.SHARED_DB_USER}:{self.SHARED_DB_PASSWORD}@{self.SHARED_DB_HOST}:{self.SHARED_DB_PORT}/{self.SHARED_DB_NAME}"
+        """Generate PostgreSQL connection URL for shared database (TLS required)"""
+        return (f"postgresql://{self.SHARED_DB_USER}:{self.SHARED_DB_PASSWORD}"
+                f"@{self.SHARED_DB_HOST}:{self.SHARED_DB_PORT}/{self.SHARED_DB_NAME}"
+                f"?sslmode=require")
     
     class Config:
         # Look for .env file in the config directory

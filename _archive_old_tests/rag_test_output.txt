@@ -1,0 +1,65 @@
+==============================================================
+ SPRINT 4 — RAG SYSTEM FULL TEST SUITE
+==============================================================
+
+[T1] RAG System Status
+  [PASS] HTTP 200
+  [PASS] Ollama running
+  [PASS] llama3.2 model active
+  [PASS] ChromaDB backend
+  [PASS] 41 FHIR mappings loaded  (41 mappings)
+  [PASS] RAG ready
+
+[T2] Ollama Model Listing
+  [PASS] HTTP 200
+  [PASS] llama3.2:3b present
+  [PASS] nomic-embed-text present
+
+[T3] FHIR Field Mapping Accuracy (7 known fields)
+  [FAIL] patient_id             -> unknown                                  conf=0%  (152165ms)
+  [FAIL] date_of_birth          -> unknown                                  conf=0%  (152199ms)
+  [FAIL] first_name             -> unknown                                  conf=0%  (152180ms)
+  [FAIL] phone_number           -> unknown                                  conf=0%  (152138ms)
+  [FAIL] admission_date         -> unknown                                  conf=0%  (152152ms)
+  [FAIL] result_value           -> unknown                                  conf=0%  (152131ms)
+  [FAIL] medication_name        -> unknown                                  conf=0%  (152251ms)
+  [FAIL] Accuracy ≥ 70% (0%)  (0/7)
+
+[T4] Unknown/Variant Field Mapping (AI generalisation)
+  [~   ] dob                    → unknown                             conf=0%
+  [~   ] fname                  → unknown                             conf=0%
+  [~   ] mobile                 → unknown                             conf=0%
+  [~   ] test_result            → unknown                             conf=0%
+  Generalisation: 0/4 variant fields mapped correctly
+
+[T5] Full Schema Mapping — patients table
+  [FAIL] HTTP 200
+  [FAIL] Schema accuracy ≥ 70% (0%)
+  [FAIL] Stats returned  (total=0)
+  Accuracy: 0%  high=0  medium=0  low=0  (2086ms)
+
+[T6] Confirm Mapping (RAG learning)
+  [PASS] HTTP 200
+  [FAIL] Saved=True
+  [FAIL] Count increased  (now 41)
+
+[T7] Clinical Chat (Ollama Q&A grounded in FHIR DB)
+  [FAIL] Q: How many patients are in the system?
+        A: error: httpconnectionpool(host='localhost', port=11434): read timed out. (read timeout=120)...
+        grounded=False  keywords_found=True  (122154ms)
+  [FAIL] Q: What is the gender distribution of patients?
+        A: error: httpconnectionpool(host='localhost', port=11434): read timed out. (read timeout=120)...
+        grounded=False  keywords_found=False  (122155ms)
+  [FAIL] Q: What is the data quality breakdown?
+        A: error: httpconnectionpool(host='localhost', port=11434): read timed out. (read timeout=120)...
+        grounded=False  keywords_found=False  (122163ms)
+  [FAIL] Chat accuracy 0/3
+
+==============================================================
+ RESULTS: 10/17 PASSED  (59%)
+ Mapping accuracy:  0%  (target: >85%)
+ Schema accuracy:   0%
+ Chat accuracy:     0/3
+ Vector store:      41 mappings
+ Model:             llama3.2:3b (fully local, no API key)
+==============================================================

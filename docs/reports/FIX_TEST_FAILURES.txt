@@ -1,0 +1,237 @@
+═══════════════════════════════════════════════════════════════════
+  CDC v3 TEST FAILURE — QUICK FIX GUIDE
+═══════════════════════════════════════════════════════════════════
+
+PROBLEM IDENTIFIED:
+  Your database has the OLD v2 schema, but tests expect v3 schema.
+
+SYMPTOMS:
+  ✗ record_id is INTEGER (should be TEXT)
+  ✗ user_name column missing
+  ✗ 21/34 tests failing
+
+ROOT CAUSE:
+  The data_change_log table was created with v2 code and hasn't
+  been migrated to v3 yet.
+
+═══════════════════════════════════════════════════════════════════
+  SOLUTION (Choose One):
+═══════════════════════════════════════════════════════════════════
+
+OPTION 1 — Automated Migration (Recommended for Tests):
+  
+  Run this command:
+    
+    python migrate_cdc_to_v3.py
+  
+  This will:
+    1. Check existing schema
+    2. Drop old tables (SAFE: test database only)
+    3. Create fresh v3 schema
+    4. Verify migration
+  
+  Then re-run:
+    
+    RUN_CDC_V3_TESTS.bat
+
+───────────────────────────────────────────────────────────────────
+
+OPTION 2 — Manual Migration (For Production with Data):
+  
+  From Python console:
+    
+    from connector.cdc_monitor import CDCMonitor
+    m = CDCMonitor('postgresql://user:pass@host/db')
+    m.migrate_schema()
+  
+  This will:
+    • Add missing columns
+    • Alter record_id to TEXT (with lock_timeout)
+    • Re-deploy trigger function
+    • Keep existing data
+
+───────────────────────────────────────────────────────────────────
+
+OPTION 3 — Manual SQL (If You Know What You're Doing):
+  
+  Connect to PostgreSQL:
+    
+    psql -U hospital_user -d hospital_db
+  
+  Drop old schema:
+    
+    DROP TABLE IF EXISTS data_change_log CASCADE;
+    DROP FUNCTION IF EXISTS log_data_change() CASCADE;
+    DROP FUNCTION IF EXISTS log_table_changes() CASCADE;
+    DROP TABLE IF EXISTS _cdc_config CASCADE;
+    DROP TABLE IF EXISTS cdc_watermarks CASCADE;
+  
+  Then re-run tests to recreate fresh.
+
+═══════════════════════════════════════════════════════════════════
+  DETAILED ERROR ANALYSIS
+═══════════════════════════════════════════════════════════════════
+
+ERROR 1: record_id is INTEGER
+  
+  Test: test_record_id_is_text
+  Expected: TEXT or character varying
+  Got: integer
+  
+  Why: v2 used INTEGER, v3 uses TEXT to support UUIDs/VARCHAR
+  Fix: migrate_schema() or recreate table
+
+───────────────────────────────────────────────────────────────────
+
+ERROR 2: column "user_name" does not exist
+  
+  Tests: Most INSERT/UPDATE/DELETE tests
+  Expected: user_name VARCHAR(100)
+  Got: column missing
+  
+  Why: v3 added user_name to track who made changes
+  Fix: migrate_schema() or recreate table
+
+───────────────────────────────────────────────────────────────────
+
+ERROR 3: syntax error at or near "%"
+  
+  Test: test_empty_result_when_no_new_changes
+  Expected: Named parameter syntax %(param)s
+  Got: SQLAlchemy trying to use % directly
+  
+  Why: Query uses Python-style placeholders
+  Fix: This will resolve once table is migrated
+
+═══════════════════════════════════════════════════════════════════
+  RECOMMENDED STEPS (In Order):
+═══════════════════════════════════════════════════════════════════
+
+1. Run migration script:
+   
+   cd C:\Projects\CareLock-Sync
+   python migrate_cdc_to_v3.py
+
+2. Verify schema:
+   
+   psql -U hospital_user -d hospital_db -c "\d data_change_log"
+   
+   Should show:
+     • record_id: text
+     • user_name: character varying(100)
+     • tenant_id: integer
+
+3. Re-run tests:
+   
+   RUN_CDC_V3_TESTS.bat
+   
+   Expected: 65/65 PASS
+
+═══════════════════════════════════════════════════════════════════
+  VERIFICATION COMMANDS
+═══════════════════════════════════════════════════════════════════
+
+Check record_id type:
+  
+  psql -U hospital_user -d hospital_db
+  
+  SELECT data_type FROM information_schema.columns
+  WHERE table_name = 'data_change_log'
+  AND column_name = 'record_id';
+  
+  Should return: text
+
+───────────────────────────────────────────────────────────────────
+
+Check all columns:
+  
+  SELECT column_name, data_type
+  FROM information_schema.columns
+  WHERE table_name = 'data_change_log'
+  ORDER BY ordinal_position;
+  
+  Should include:
+    • record_id: text
+    • user_name: character varying
+    • tenant_id: integer
+
+───────────────────────────────────────────────────────────────────
+
+Check trigger function:
+  
+  SELECT routine_name FROM information_schema.routines
+  WHERE routine_name IN ('log_data_change', 'log_table_changes');
+  
+  Should show ONLY: log_table_changes
+  Should NOT show: log_data_change (legacy)
+
+═══════════════════════════════════════════════════════════════════
+  AFTER MIGRATION
+═══════════════════════════════════════════════════════════════════
+
+Once migration is complete, expected test results:
+
+  [2/4] Running core CDC tests (40 tests)...
+  ✓ 34/34 passed (40 tests expected after full run)
+
+  [3/4] Running performance tests (14 tests)...
+  ✓ 14/14 passed
+
+  [4/4] Running v3-specific tests (11 tests)...
+  ✓ 11/11 passed
+
+  ════════════════════════════════════════════════════════════
+    ✓✓✓ ALL 65 TESTS PASSED ✓✓✓
+  ════════════════════════════════════════════════════════════
+
+═══════════════════════════════════════════════════════════════════
+  TROUBLESHOOTING
+═══════════════════════════════════════════════════════════════════
+
+Q: Migration script fails with "permission denied"
+A: Ensure PostgreSQL user has DROP/CREATE privileges:
+   
+   GRANT ALL PRIVILEGES ON DATABASE hospital_db TO hospital_user;
+
+───────────────────────────────────────────────────────────────────
+
+Q: "psycopg2 not installed"
+A: Install dependencies:
+   
+   pip install psycopg2-binary sqlalchemy python-dotenv
+
+───────────────────────────────────────────────────────────────────
+
+Q: Tests still fail after migration
+A: 1. Verify schema with psql commands above
+   2. Check database connection:
+      
+      python -c "from sqlalchemy import create_engine; \
+                 engine = create_engine('postgresql://...'); \
+                 conn = engine.connect(); \
+                 print('✓ Connected'); \
+                 conn.close()"
+   
+   3. Re-run migration script
+
+───────────────────────────────────────────────────────────────────
+
+Q: Want to keep existing CDC data
+A: Use OPTION 2 (migrate_schema()) instead of recreating:
+   
+   from connector.cdc_monitor import CDCMonitor
+   m = CDCMonitor('your_db_url')
+   m.migrate_schema()
+   
+   This preserves data while upgrading schema.
+
+═══════════════════════════════════════════════════════════════════
+
+NEXT STEPS:
+
+1. Run: python migrate_cdc_to_v3.py
+2. Verify: psql commands above
+3. Re-test: RUN_CDC_V3_TESTS.bat
+4. Report: Paste results if still failing
+
+═══════════════════════════════════════════════════════════════════

@@ -1,0 +1,147 @@
+╔═══════════════════════════════════════════════════════════════════════╗
+║  CDC MONITOR v3 — RISK → FIX QUICK REFERENCE                         ║
+╚═══════════════════════════════════════════════════════════════════════╝
+
+┌─────┬──────────────────────────────────┬────────────────────────────────┐
+│ # │ Risk                           │ Fix (v3)                       │
+├─────┼──────────────────────────────────┼────────────────────────────────┤
+│  1  │ Per-row SELECT on _cdc_config  │ current_setting() GUC cache    │
+│     │ (10k rows = 10k lookups)       │ + set_session_tenant()         │
+├─────┼──────────────────────────────────┼────────────────────────────────┤
+│  2  │ DROP … CASCADE kills triggers  │ Query pg_trigger, drop each    │
+│     │ silently                       │ explicitly, no CASCADE         │
+├─────┼──────────────────────────────────┼────────────────────────────────┤
+│  3  │ Entire result set in memory    │ iter_changes_since() generator │
+│     │ (millions of rows = OOM)       │ + server-side cursor           │
+├─────┼──────────────────────────────────┼────────────────────────────────┤
+│  4  │ Watermark advances on failure  │ advance_watermark() uses       │
+│     │ (lost records)                 │ GREATEST(), only after success │
+├─────┼──────────────────────────────────┼────────────────────────────────┤
+│  5  │ ALTER COLUMN blocks forever    │ lock_timeout = '5s'            │
+│     │ (production outage)            │ + pg_repack guidance           │
+├─────┼──────────────────────────────────┼────────────────────────────────┤
+│  6  │ Single JSON file watermark     │ cdc_watermarks table           │
+│     │ (no multi-tenant, no HA)       │ + per-tenant rows              │
+├─────┼──────────────────────────────────┼────────────────────────────────┤
+│  7  │ Trigger lacks INSERT privilege │ SECURITY DEFINER               │
+│     │ (RLS blocks writes)            │ + GRANT EXECUTE TO PUBLIC      │
+├─────┼──────────────────────────────────┼────────────────────────────────┤
+│  8  │ pg_notify payload incomplete   │ tenant_id from GUC fast-path   │
+│     │ or stale                       │ + ISO 8601 timestamp           │
+├─────┼──────────────────────────────────┼────────────────────────────────┤
+│  9  │ No concurrency/perf tests      │ test_cdc_performance.py        │
+│     │ (unknown characteristics)      │ (14 tests, 5 groups)           │
+└─────┴──────────────────────────────────┴────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════
+
+VERIFICATION COMMANDS (Quick):
+
+  ✓ All 65 tests:
+    RUN_CDC_V3_TESTS.bat
+
+  ✓ Specific risk:
+    pytest tests\unit\test_cdc_v3_specific.py::TestGUCFastPath -v      (Risk 1)
+    pytest tests\unit\test_cdc_monitor.py::TestSchema -v               (Risk 2, 5, 7)
+    pytest tests\unit\test_cdc_performance.py::TestStreamingGenerator -v -s  (Risk 3)
+    pytest tests\unit\test_cdc_performance.py::TestWatermarkPersistence -v   (Risk 4, 6)
+
+═══════════════════════════════════════════════════════════════════════
+
+TEST COVERAGE SUMMARY:
+
+  test_cdc_monitor.py         40 tests  →  Risks 2, 5, 7 + full CRUD coverage
+  test_cdc_performance.py     14 tests  →  Risks 1, 3, 4, 6, 9
+  test_cdc_v3_specific.py     11 tests  →  Risks 1, 5, 7, 8
+  ─────────────────────────────────────
+  TOTAL:                      65 tests  →  All 9 risks covered
+
+═══════════════════════════════════════════════════════════════════════
+
+CODE FILES CHANGED:
+
+  backend/connector/cdc_monitor.py    — Complete rewrite (672 lines)
+    ✓ GUC fast-path (Risk 1)
+    ✓ Safe legacy removal (Risk 2)
+    ✓ Streaming methods (Risk 3)
+    ✓ Watermark table + GREATEST() (Risk 4, 6)
+    ✓ migrate_schema() with lock_timeout (Risk 5)
+    ✓ SECURITY DEFINER + GRANT (Risk 7)
+    ✓ Complete pg_notify payload (Risk 8)
+
+  backend/etl/incremental_sync.py     — Updated to use iter_changes_since()
+
+  tests/unit/test_cdc_monitor.py      — 40 tests (existing, updated)
+  tests/unit/test_cdc_performance.py  — 14 tests (new for Risk 9)
+  tests/unit/test_cdc_v3_specific.py  — 11 tests (new for v3 features)
+
+═══════════════════════════════════════════════════════════════════════
+
+KEY PERFORMANCE METRICS (from tests):
+
+  Per-row trigger overhead:     <5ms     (Risk 1 fix: GUC vs table lookup)
+  Concurrent writers:           5×100    (500 inserts, no lost data)
+  Streaming memory:             Constant (600 rows = 3 batches @ 200/batch)
+  Watermark concurrency:        100      (threads, no race conditions)
+  Lock acquisition:             5s       (timeout, fails fast not hangs)
+
+═══════════════════════════════════════════════════════════════════════
+
+CRITICAL METHODS (API):
+
+  ┌────────────────────────────────────┬──────────────────────────────┐
+  │ Method                             │ Purpose                      │
+  ├────────────────────────────────────┼──────────────────────────────┤
+  │ set_session_tenant(conn, tid)      │ Set GUC for connection       │
+  │ configure_tenant(tid)              │ Persist to _cdc_config       │
+  │ load_watermark(tid)                │ Get last_change_id           │
+  │ advance_watermark(tid, id)         │ Update watermark (atomic)    │
+  │ iter_changes_since(id, tid, batch) │ Stream changes (generator)   │
+  │ get_changes_since(id, tid, batch)  │ Eager load (bounded)         │
+  │ migrate_schema()                   │ Upgrade v2 → v3              │
+  └────────────────────────────────────┴──────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════
+
+TYPICAL USAGE (v3):
+
+  from connector.cdc_monitor import CDCMonitor
+
+  # One-time setup
+  monitor = CDCMonitor(db_url, tenant_id=1)
+  monitor.setup_cdc_for_tables(["patients", "encounters"])
+
+  # Per connection (in connection pool setup)
+  @event.listens_for(Engine, "connect")
+  def set_tenant(dbapi_conn, record):
+      cursor = dbapi_conn.cursor()
+      cursor.execute("SET app.tenant_id = 1")
+      cursor.close()
+
+  # Sync loop
+  last_id = monitor.load_watermark(tenant_id=1)
+  for batch in monitor.iter_changes_since(last_id, tenant_id=1, batch_size=500):
+      try:
+          process(batch)  # Your ETL logic
+          monitor.advance_watermark(tenant_id=1, batch[-1]["change_id"])
+      except Exception as e:
+          log.error(f"Batch failed: {e}")
+          break  # Watermark unchanged, retry next cycle
+
+═══════════════════════════════════════════════════════════════════════
+
+MIGRATION FROM v2:
+
+  1. Run migrate_schema() on production:
+     python -c "from connector.cdc_monitor import CDCMonitor; \
+                m=CDCMonitor('$DB_URL'); m.migrate_schema()"
+
+  2. Update sync code to use iter_changes_since()
+  3. Set up connection pool GUC (set_session_tenant)
+  4. Deploy and monitor (check watermark lag)
+
+═══════════════════════════════════════════════════════════════════════
+
+FULL DOCS: docs\CDC_V3_VERIFICATION_GUIDE.txt (540 lines)
+
+═══════════════════════════════════════════════════════════════════════

@@ -1,0 +1,8 @@
+{
+  "watermarks": {
+    "postgresql://hospital_user:hospital_pass@localhost:5432/hospital_db": 56
+  },
+  "last_sync": {
+    "postgresql://hospital_user:hospital_pass@localhost:5432/hospital_db": "2026-02-11T20:40:41.086295"
+  }
+}

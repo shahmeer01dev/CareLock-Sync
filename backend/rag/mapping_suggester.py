@@ -1,134 +1,180 @@
 """
-RAG-Powered Mapping Suggester - Main Intelligence Engine
+FHIR Mapping Suggester - Sprint 4 v2
+Dual-model architecture:
+  - mapping_model: llama3.2:3b  (lightweight, fast, for field mapping)
+  - chat_model:    phi3          (richer, for RAG chatbot / Q&A)
+Human-in-the-loop: all suggestions are status='pending_review' until confirmed.
 """
 from typing import Dict, List, Any, Optional
-from rag.gemini_client import GeminiClient
+from rag.ollama_client import OllamaClient
 from rag.vector_store import MappingVectorStore
-import os
 
 
 class MappingSuggester:
-    """RAG-based system for intelligent FHIR field mapping"""
-    
     def __init__(
         self,
-        gemini_api_key: Optional[str] = None,
-        vector_store_path: str = "./chroma_db",
-        auto_load_existing: bool = True
+        mapping_model: str = "llama3.2:3b",
+        chat_model: str = "phi3",
+        ollama_base_url: str = "http://localhost:11434",
+        vector_store_path: str = "./databases/chroma",
+        auto_load: bool = True,
     ):
-        """Initialize RAG mapping suggester"""
-        self.gemini = GeminiClient(gemini_api_key)
-        self.vector_store = MappingVectorStore(persist_directory=vector_store_path)
-        
-        if auto_load_existing:
-            self.load_existing_mappings()
-    
-    def load_existing_mappings(self):
-        """Load existing mappings as training data"""
-        print("Loading existing FHIR mappings...")
-        count = self.vector_store.load_from_mapping_config()
-        print(f"Loaded {count} existing mappings")
-    
+        print(f"Initialising RAG engine...")
+        print(f"  mapping_model : {mapping_model}  (fast/lightweight)")
+        print(f"  chat_model    : {chat_model}  (richer, for chatbot)")
+        self.mapping_client = OllamaClient(
+            model=mapping_model, base_url=ollama_base_url, timeout=120)
+        self._chat_model = chat_model
+        self._ollama_base_url = ollama_base_url
+        self._chat_client: Optional[OllamaClient] = None
+        self.vs = MappingVectorStore(
+            persist_directory=vector_store_path,
+            ollama_client=self.mapping_client,
+            auto_seed=auto_load,
+        )
+        print(f"RAG ready | mappings={self.vs.get_statistics()['total_mappings']}")
+
+
     def suggest_mapping(
         self,
         field_name: str,
         field_type: str,
         sample_values: Optional[List] = None,
-        fhir_resource: str = 'Patient',
-        n_similar: int = 5
+        fhir_resource: str = "Patient",
+        n_similar: int = 5,
     ) -> Dict[str, Any]:
-        """Suggest FHIR mapping for a single field"""
-        print(f"Suggesting mapping for: {field_name} ({field_type})")
-        
-        # RAG Retrieval - Find similar mappings
-        similar_mappings = self.vector_store.find_similar_mappings(
-            field_name=field_name,
-            field_type=field_type,
-            n_results=n_similar,
-            min_similarity=0.3
+        similar = self.vs.find_similar_mappings(
+            field_name, field_type, fhir_resource, n_similar, 0.2)
+        # Fast-path: strong retrieval match - skip LLM entirely
+        if similar and similar[0]["similarity"] >= 0.88:
+            top = similar[0]
+            return {
+                "source_field": field_name,
+                "source_type": field_type,
+                "fhir_resource": fhir_resource,
+                "target_path": top["target_path"],
+                "confidence": round(top["similarity"], 2),
+                "reasoning": f"Retrieval match: '{top['source_field']}' ({top['similarity']:.0%})",
+                "transformation": top.get("transformation", "none"),
+                "similar_mappings": similar,
+                "method": "retrieval",
+                "status": "pending_review",
+            }
+        suggestion = self.mapping_client.generate_mapping_suggestion(
+            {"name": field_name, "type": field_type,
+             "sample_values": sample_values or []},
+            similar, fhir_resource,
         )
-        
-        print(f"  Found {len(similar_mappings)} similar mappings")
-        
-        # RAG Generation - Use Gemini
-        suggestion = self.gemini.generate_mapping_suggestion(
-            source_field={
-                'name': field_name,
-                'type': field_type,
-                'sample_values': sample_values or []
-            },
-            similar_mappings=similar_mappings,
-            fhir_resource=fhir_resource
-        )
-        
-        # Augment with retrieval results
-        suggestion['source_field'] = field_name
-        suggestion['source_type'] = field_type
-        suggestion['fhir_resource'] = fhir_resource
-        suggestion['similar_mappings'] = similar_mappings
-        
-        print(f"  Suggested: {suggestion['target_path']} ({suggestion['confidence']:.0%})")
-        
-        return suggestion
-    
+        return {
+            "source_field": field_name,
+            "source_type": field_type,
+            "fhir_resource": fhir_resource,
+            **suggestion,
+            "similar_mappings": similar,
+            "method": "rag",
+            "status": "pending_review",
+        }
+
+
     def suggest_schema_mapping(
         self,
         schema: Dict[str, Any],
-        fhir_resource: str = 'Patient'
+        fhir_resource: str = "Patient",
     ) -> Dict[str, Any]:
-        """Suggest FHIR mappings for entire schema"""
-        print(f"\nSuggesting mappings for: {schema.get('table_name', 'unknown')}")
-        print("=" * 70)
-        
+        table = schema.get("table_name", "unknown")
+        print(f"\nGenerating suggestions: {table} -> FHIR {fhir_resource}")
+        print("-" * 64)
         mappings = []
-        stats = {
-            'total_fields': 0,
-            'high_confidence': 0,
-            'medium_confidence': 0,
-            'low_confidence': 0,
-            'needs_review': 0
-        }
-        
-        for column in schema.get('columns', []):
-            stats['total_fields'] += 1
-            
-            suggestion = self.suggest_mapping(
-                field_name=column['name'],
-                field_type=column['type'],
-                sample_values=column.get('sample_values'),
-                fhir_resource=fhir_resource
-            )
-            
-            mappings.append(suggestion)
-            
-            confidence = suggestion['confidence']
-            if confidence >= 0.8:
-                stats['high_confidence'] += 1
-            elif confidence >= 0.5:
-                stats['medium_confidence'] += 1
-            else:
-                stats['low_confidence'] += 1
-            
-            if confidence < 0.7:
-                stats['needs_review'] += 1
-        
-        print("\n" + "=" * 70)
-        print("Schema Mapping Summary:")
-        print(f"  Total Fields: {stats['total_fields']}")
-        print(f"  High Confidence (>=80%): {stats['high_confidence']}")
-        print(f"  Medium Confidence (50-80%): {stats['medium_confidence']}")
-        print(f"  Low Confidence (<50%): {stats['low_confidence']}")
-        print(f"  Needs Review: {stats['needs_review']}")
-        print("=" * 70)
-        
+        for col in schema.get("columns", []):
+            r = self.suggest_mapping(
+                col["name"], col.get("type", "varchar"),
+                col.get("sample_values"), fhir_resource)
+            mappings.append(r)
+            icon = "+" if r["confidence"] >= 0.8 else ("~" if r["confidence"] >= 0.5 else "?")
+            print(f"  [{icon}] {col['name']:<22} -> {r['target_path']:<36}"
+                  f" {r['confidence']:>4.0%}  [{r['method']}]")
+        high = sum(1 for m in mappings if m["confidence"] >= 0.80)
+        acc = high / len(mappings) * 100 if mappings else 0
+        print("-" * 64)
+        print(f"  Accuracy: {acc:.0f}%  ({high}/{len(mappings)} high-confidence)")
+        print(f"  Status: ALL pending - awaiting review\n")
         return {
-            'table_name': schema.get('table_name'),
-            'fhir_resource': fhir_resource,
-            'mappings': mappings,
-            'statistics': stats
+            "table_name": table,
+            "fhir_resource": fhir_resource,
+            "mappings": mappings,
+            "statistics": {
+                "total": len(mappings),
+                "high": high,
+                "medium": sum(1 for m in mappings if 0.5 <= m["confidence"] < 0.8),
+                "low": sum(1 for m in mappings if m["confidence"] < 0.5),
+            },
+            "accuracy_pct": round(acc, 1),
+            "status": "pending_review",
         }
-    
-    def save_mapping(self, mapping: Dict):
-        """Save mapping for future learning"""
-        self.vector_store.add_mapping(mapping)
-        print(f"Saved: {mapping['source_field']} -> {mapping['target_path']}")
+
+    def confirm_mappings(
+        self,
+        mappings: List[Dict[str, Any]],
+        confirmed_ids: List[str],
+    ) -> Dict[str, Any]:
+        saved, skipped = [], []
+        for m in mappings:
+            if m["source_field"] in confirmed_ids:
+                self.vs.add_mapping({
+                    "source_field": m["source_field"],
+                    "source_type": m.get("source_type", "varchar"),
+                    "target_path": m["target_path"],
+                    "fhir_resource": m["fhir_resource"],
+                    "transformation": m.get("transformation", "none"),
+                    "confidence": m["confidence"],
+                })
+                saved.append(m["source_field"])
+            else:
+                skipped.append(m["source_field"])
+        return {"saved": saved, "skipped": skipped, "total_saved": len(saved)}
+
+    @property
+    def chat_client(self) -> OllamaClient:
+        if self._chat_client is None:
+            self._chat_client = OllamaClient(
+                model=self._chat_model,
+                base_url=self._ollama_base_url,
+                timeout=180,
+            )
+        return self._chat_client
+
+    def chat(self, question: str, context: Optional[str] = None) -> str:
+        if context is None:
+            similar = self.vs.find_similar_mappings(question, "text", None, 5, 0.3)
+            context = "\n".join(
+                f"- {m['source_field']} -> {m['target_path']} ({m['fhir_resource']})"
+                for m in similar) or "No relevant mappings found."
+        prompt = f"""You are a FHIR R4 expert for CareLock healthcare data.
+Answer concisely using the context below.
+
+Context:
+{context}
+
+Question: {question}
+Answer:"""
+        try:
+            return self.chat_client._generate(prompt).strip()
+        except Exception as e:
+            return f"Chat error: {e}"
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            "mapping_model": self.mapping_client.model,
+            "chat_model": self._chat_model,
+            "mapping_available": self.mapping_client.is_available(),
+            "chat_available": self._chat_client.is_available() if self._chat_client else None,
+            **self.vs.get_statistics(),
+        }
+
+    def save_confirmed_mapping(self, source_field, source_type, target_path,
+                                fhir_resource="Patient", transformation="none", confidence=1.0):
+        self.vs.add_mapping({
+            "source_field": source_field, "source_type": source_type,
+            "target_path": target_path, "fhir_resource": fhir_resource,
+            "transformation": transformation, "confidence": confidence,
+        })

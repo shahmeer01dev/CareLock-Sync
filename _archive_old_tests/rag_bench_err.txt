@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "C:\Projects\CareLock-Sync\run_rag_benchmark.py", line 98, in <module>
+    log(f"  Known fields:  {pass1}/{total1} correct  \u2192  {accuracy1}%  (avg {avg_ms}ms/call)")
+  File "C:\Projects\CareLock-Sync\run_rag_benchmark.py", line 60, in log
+    print(s)
+  File "C:\Users\03-134222-111\AppData\Local\Programs\Python\Python310\lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2192' in position 31: character maps to <undefined>

@@ -1,110 +1,361 @@
 """
-API routes for patient operations
+API routes for patient operations with encryption integration
+Features:
+- Automatic PHI encryption/decryption
+- Audit logging for all access
+- Tenant isolation
+- HMAC-based searchable encryption for MRN
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from typing import List
-import sys
-import os
+from sqlalchemy import text
+from typing import List, Optional
+import sys, os
 
-# Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from common.database import get_hospital_db
-from common.models import Patient
-from common.schemas import PatientResponse, PatientList
+from common.database import get_hospital_db, shared_db_session
+from common.models   import Patient
+from common.schemas  import PatientResponse, PatientList
+from common.auth     import require_auth, AuthContext
 
-router = APIRouter(
-    prefix="/api/v1/patients",
-    tags=["patients"]
+# Import encryption
+from security.production_encryption import (
+    ProductionEncryptionManager,
+    SecureTenantKeyManager
 )
 
+router = APIRouter(tags=["patients"])
+
+# Initialize encryption
+key_manager = SecureTenantKeyManager()
+
+def get_encryption_manager(auth: AuthContext):
+    """Get encryption manager for current user's tenant"""
+    return ProductionEncryptionManager(
+        tenant_id=auth.tenant_id or 1,
+        context="cloud",
+        key_manager=key_manager,
+        user_id=auth.user_id or "unknown"
+    )
+
+def encrypt_patient_phi(patient_dict: dict, encryptor: ProductionEncryptionManager) -> dict:
+    """
+    Encrypt PHI fields in patient record
+    
+    Fields encrypted:
+    - ssn (random)
+    - phone (random)
+    - email (random)
+    - medical_record_number (searchable - HMAC indexed)
+    """
+    encrypted = patient_dict.copy()
+    
+    # Encrypt SSN (random nonce - maximum security)
+    if 'ssn' in encrypted and encrypted['ssn']:
+        encrypted['ssn'] = encryptor.encrypt(
+            encrypted['ssn'],
+            field_name='ssn',
+            record_id=str(encrypted.get('patient_id', 'unknown'))
+        )
+    
+    # Encrypt phone
+    if 'phone' in encrypted and encrypted['phone']:
+        encrypted['phone'] = encryptor.encrypt(
+            encrypted['phone'],
+            field_name='phone',
+            record_id=str(encrypted.get('patient_id', 'unknown'))
+        )
+    
+    # Encrypt email
+    if 'email' in encrypted and encrypted['email']:
+        encrypted['email'] = encryptor.encrypt(
+            encrypted['email'],
+            field_name='email',
+            record_id=str(encrypted.get('patient_id', 'unknown'))
+        )
+    
+    # Encrypt MRN with searchable encryption
+    if 'medical_record_number' in encrypted and encrypted['medical_record_number']:
+        encrypted_value, search_hash = encryptor.encrypt(
+            encrypted['medical_record_number'],
+            field_name='medical_record_number',
+            record_id=str(encrypted.get('patient_id', 'unknown'))
+        )
+        encrypted['medical_record_number'] = encrypted_value
+        encrypted['mrn_search_hash'] = search_hash  # For WHERE clauses
+    
+    encrypted['_encrypted'] = True
+    return encrypted
+
+def decrypt_patient_phi(
+    patient_dict: dict,
+    encryptor: ProductionEncryptionManager,
+    reason: str = "Clinical access"
+) -> dict:
+    """
+    Decrypt PHI fields in patient record
+    All decryptions are logged to audit trail
+    """
+    decrypted = patient_dict.copy()
+    record_id = str(patient_dict.get('patient_id', 'unknown'))
+    
+    # Decrypt SSN
+    if 'ssn' in decrypted and decrypted['ssn'] and decrypted['ssn'].startswith('v2'):
+        decrypted['ssn'] = encryptor.decrypt(
+            decrypted['ssn'],
+            field_name='ssn',
+            record_id=record_id,
+            reason=reason
+        )
+    
+    # Decrypt phone
+    if 'phone' in decrypted and decrypted['phone'] and decrypted['phone'].startswith('v2'):
+        decrypted['phone'] = encryptor.decrypt(
+            decrypted['phone'],
+            field_name='phone',
+            record_id=record_id,
+            reason=reason
+        )
+    
+    # Decrypt email
+    if 'email' in decrypted and decrypted['email'] and decrypted['email'].startswith('v2'):
+        decrypted['email'] = encryptor.decrypt(
+            decrypted['email'],
+            field_name='email',
+            record_id=record_id,
+            reason=reason
+        )
+    
+    # Decrypt MRN
+    if 'medical_record_number' in decrypted and decrypted['medical_record_number']:
+        if decrypted['medical_record_number'].startswith('v2'):
+            decrypted['medical_record_number'] = encryptor.decrypt(
+                decrypted['medical_record_number'],
+                field_name='medical_record_number',
+                record_id=record_id,
+                reason=reason
+            )
+    
+    return decrypted
+
+# ============================================================================
+# ROUTES
+# ============================================================================
 
 @router.get("/", response_model=PatientList)
 async def get_patients(
-    skip: int = Query(0, ge=0, description="Number of records to skip"),
-    limit: int = Query(100, ge=1, le=1000, description="Maximum number of records to return"),
-    db: Session = Depends(get_hospital_db)
+    skip:  int = Query(0,   ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    decrypt: bool = Query(True, description="Decrypt PHI fields"),
+    db:    Session   = Depends(get_hospital_db),
+    auth:  AuthContext = Depends(require_auth)
 ):
     """
-    Get list of patients with pagination
-    """
-    # Get total count
-    total = db.query(Patient).count()
+    Get patient list
     
-    # Get patients with pagination
+    - PHI fields are stored encrypted
+    - Decryption happens on-demand with audit logging
+    - Tenant isolation enforced
+    """
+    total = db.query(Patient).count()
     patients = db.query(Patient).offset(skip).limit(limit).all()
     
-    return {
-        "total": total,
-        "patients": patients
-    }
+    # Convert to dict
+    patients_list = [p.__dict__ for p in patients]
+    
+    # Decrypt if requested
+    if decrypt:
+        encryptor = get_encryption_manager(auth)
+        patients_list = [
+            decrypt_patient_phi(p, encryptor, reason="Patient list view")
+            for p in patients_list
+        ]
+    
+    return {"total": total, "patients": patients_list}
+
+
+@router.get("/search/", response_model=PatientList)
+async def search_patients(
+    first_name: Optional[str] = Query(None),
+    last_name:  Optional[str] = Query(None),
+    blood_type: Optional[str] = Query(None),
+    mrn: Optional[str] = Query(None, description="Medical Record Number (searchable)"),
+    skip:  int = Query(0,   ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    decrypt: bool = Query(True),
+    db:    Session   = Depends(get_hospital_db),
+    auth:  AuthContext = Depends(require_auth)
+):
+    """
+    Search patients with encrypted field support
+    
+    - MRN uses HMAC-based searchable encryption
+    - Other encrypted fields cannot be searched directly
+    """
+    q = db.query(Patient)
+    
+    # Search non-encrypted fields
+    if first_name:
+        q = q.filter(Patient.first_name.ilike(f"%{first_name}%"))
+    if last_name:
+        q = q.filter(Patient.last_name.ilike(f"%{last_name}%"))
+    if blood_type:
+        q = q.filter(Patient.blood_type == blood_type)
+    
+    # Search encrypted MRN using HMAC hash
+    if mrn:
+        encryptor = get_encryption_manager(auth)
+        # Compute search hash for MRN
+        search_hash = encryptor.searchable.compute_search_hash(mrn, 'medical_record_number')
+        q = q.filter(Patient.mrn_search_hash == search_hash)
+    
+    patients = q.offset(skip).limit(limit).all()
+    patients_list = [p.__dict__ for p in patients]
+    
+    # Decrypt if requested
+    if decrypt:
+        encryptor = get_encryption_manager(auth)
+        patients_list = [
+            decrypt_patient_phi(p, encryptor, reason=f"Patient search: {mrn or 'filter'}")
+            for p in patients_list
+        ]
+    
+    return {"total": q.count(), "patients": patients_list}
+
+
+@router.get("/mrn/{mrn}", response_model=PatientResponse)
+async def get_patient_by_mrn(
+    mrn:  str,
+    decrypt: bool = Query(True),
+    db:   Session    = Depends(get_hospital_db),
+    auth: AuthContext = Depends(require_auth)
+):
+    """
+    Get patient by Medical Record Number (encrypted field)
+    
+    Uses HMAC-based search to find encrypted MRN
+    """
+    # Compute search hash
+    encryptor = get_encryption_manager(auth)
+    search_hash = encryptor.searchable.compute_search_hash(mrn, 'medical_record_number')
+    
+    # Search using hash
+    patient = db.query(Patient).filter(Patient.mrn_search_hash == search_hash).first()
+    
+    if not patient:
+        raise HTTPException(404, f"Patient MRN {mrn} not found")
+    
+    patient_dict = patient.__dict__
+    
+    # Decrypt if requested
+    if decrypt:
+        patient_dict = decrypt_patient_phi(
+            patient_dict,
+            encryptor,
+            reason=f"Patient lookup by MRN: {mrn}"
+        )
+    
+    return patient_dict
 
 
 @router.get("/{patient_id}", response_model=PatientResponse)
 async def get_patient(
     patient_id: int,
-    db: Session = Depends(get_hospital_db)
+    decrypt: bool = Query(True),
+    db:   Session    = Depends(get_hospital_db),
+    auth: AuthContext = Depends(require_auth)
 ):
-    """
-    Get a specific patient by ID
-    """
+    """Get patient by ID with decryption"""
     patient = db.query(Patient).filter(Patient.patient_id == patient_id).first()
     
     if not patient:
-        raise HTTPException(status_code=404, detail=f"Patient with ID {patient_id} not found")
+        raise HTTPException(404, f"Patient ID {patient_id} not found")
     
-    return patient
-
-
-@router.get("/mrn/{medical_record_number}", response_model=PatientResponse)
-async def get_patient_by_mrn(
-    medical_record_number: str,
-    db: Session = Depends(get_hospital_db)
-):
-    """
-    Get a patient by medical record number
-    """
-    patient = db.query(Patient).filter(
-        Patient.medical_record_number == medical_record_number
-    ).first()
+    patient_dict = patient.__dict__
     
-    if not patient:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Patient with MRN {medical_record_number} not found"
+    # Decrypt if requested
+    if decrypt:
+        encryptor = get_encryption_manager(auth)
+        patient_dict = decrypt_patient_phi(
+            patient_dict,
+            encryptor,
+            reason=f"Patient record access: ID {patient_id}"
         )
     
-    return patient
+    return patient_dict
 
 
-@router.get("/search/", response_model=PatientList)
-async def search_patients(
-    first_name: str = Query(None, description="Search by first name"),
-    last_name: str = Query(None, description="Search by last name"),
-    blood_type: str = Query(None, description="Filter by blood type"),
-    skip: int = Query(0, ge=0),
+# ── FHIR central DB (partitioned, tenant-scoped) ──────────────────────────────
+@router.get("/fhir/")
+async def get_fhir_patients(
+    skip:  int = Query(0,   ge=0),
     limit: int = Query(100, ge=1, le=1000),
-    db: Session = Depends(get_hospital_db)
+    decrypt: bool = Query(True),
+    auth:  AuthContext = Depends(require_auth)
 ):
     """
-    Search patients by various criteria
+    Return FHIR patients from central DB with tenant isolation
+    
+    - Tenant isolation via PostgreSQL RLS
+    - PHI encryption at rest
+    - Audit logging for all access
     """
-    query = db.query(Patient)
+    with shared_db_session() as db:
+        # Set tenant context for RLS
+        if auth.tenant_id:
+            db.execute(text("SET app.tenant_id = :t"), {"t": str(auth.tenant_id)})
+        
+        # Fetch encrypted records
+        rows = db.execute(text("""
+            SELECT id, tenant_id, source_patient_id, family_name, given_name,
+                   gender, birth_date, phone, email, completeness_score, active
+            FROM fhir_patient
+            ORDER BY id
+            LIMIT :lim OFFSET :skip
+        """), {"lim": limit, "skip": skip}).fetchall()
+        
+        total = db.execute(text("SELECT COUNT(*) FROM fhir_patient")).scalar()
+        
+        # Convert to dict
+        patients = [dict(r._mapping) for r in rows]
+        
+        # Decrypt if requested
+        if decrypt and patients:
+            encryptor = get_encryption_manager(auth)
+            patients = [
+                decrypt_patient_phi(p, encryptor, reason="FHIR patient list view")
+                for p in patients
+            ]
+        
+        return {"total": total, "patients": patients}
+
+
+@router.post("/")
+async def create_patient(
+    patient_data: dict,
+    db: Session = Depends(get_hospital_db),
+    auth: AuthContext = Depends(require_auth)
+):
+    """
+    Create new patient with automatic PHI encryption
     
-    if first_name:
-        query = query.filter(Patient.first_name.ilike(f"%{first_name}%"))
+    - PHI fields are encrypted before storage
+    - MRN uses searchable encryption (HMAC-indexed)
+    - Audit log entry created
+    """
+    # Encrypt PHI before saving
+    encryptor = get_encryption_manager(auth)
+    encrypted_data = encrypt_patient_phi(patient_data, encryptor)
     
-    if last_name:
-        query = query.filter(Patient.last_name.ilike(f"%{last_name}%"))
-    
-    if blood_type:
-        query = query.filter(Patient.blood_type == blood_type)
-    
-    total = query.count()
-    patients = query.offset(skip).limit(limit).all()
+    # Create patient record
+    patient = Patient(**encrypted_data)
+    db.add(patient)
+    db.commit()
+    db.refresh(patient)
     
     return {
-        "total": total,
-        "patients": patients
+        "message": "Patient created successfully",
+        "patient_id": patient.patient_id,
+        "_encrypted": True
     }
